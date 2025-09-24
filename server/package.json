@@ -1,0 +1,61 @@
+{
+  "name": "latzero-server",
+  "version": "0.1.0",
+  "description": "LatZero process orchestration fabric server - lightweight RPC and shared memory orchestrator",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon --inspect index.js",
+    "dev:watch": "nodemon index.js",
+    "test": "jest",
+    "test:unit": "jest tests/unit",
+    "test:integration": "jest tests/integration",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "clean": "rm -rf node_modules package-lock.json && npm install"
+  },
+  "keywords": [
+    "latzero",
+    "orchestration",
+    "rpc",
+    "shared-memory",
+    "mmap",
+    "process-fabric"
+  ],
+  "author": "BRAHMAI / Kshitij",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^8.7.0",
+    "chalk": "^4.1.2",
+    "commander": "^11.1.0",
+    "mmap-io": "^1.1.7",
+    "msgpack": "^1.0.3",
+    "sql.js": "^1.13.0",
+    "uuid": "^9.0.1",
+    "ws": "^8.14.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.8.7",
+    "eslint": "^8.52.0",
+    "eslint-config-standard": "^17.1.0",
+    "eslint-plugin-import": "^2.29.0",
+    "eslint-plugin-node": "^11.1.0",
+    "eslint-plugin-promise": "^6.1.1",
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.1",
+    "supertest": "^6.3.3"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/brahmai/latzero.git"
+  },
+  "bugs": {
+    "url": "https://github.com/brahmai/latzero/issues"
+  },
+  "homepage": "https://github.com/brahmai/latzero#readme"
+}

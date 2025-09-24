@@ -1,0 +1,55 @@
+{
+  "server": {
+    "port": 45227,
+    "host": "127.0.0.1",
+    "enableTLS": false,
+    "maxConnections": 1000,
+    "connectionTimeout": 30000
+  },
+  "cluster": {
+    "enabled": false,
+    "nodeId": null,
+    "seeds": [],
+    "heartbeatInterval": 5000,
+    "gossipInterval": 10000,
+    "electionTimeout": 15000
+  },
+  "pools": {
+    "defaultPools": ["default", "system"],
+    "maxPoolsPerApp": 100,
+    "poolCleanupInterval": 300000
+  },
+  "memory": {
+    "maxBlockSize": 16777216,
+    "maxBlocksPerPool": 1000,
+    "cleanupInterval": 300000,
+    "maxIdleTime": 3600000
+  },
+  "triggers": {
+    "defaultTTL": 30000,
+    "maxConcurrentTriggers": 10000,
+    "cleanupInterval": 60000
+  },
+  "security": {
+    "encryptionAlgorithm": "aes-256-gcm",
+    "keyDerivationAlgorithm": "sha256",
+    "keyRotationCheckInterval": 3600000,
+    "encryptionCacheSize": 1000
+  },
+  "persistence": {
+    "backupInterval": 86400000,
+    "maxBackups": 7,
+    "walMode": true,
+    "cacheSize": 1000
+  },
+  "logging": {
+    "level": "info",
+    "file": "server.log",
+    "maxFileSize": 10485760,
+    "maxFiles": 5
+  },
+  "registry": {
+    "cleanupInterval": 3600000,
+    "rehydrationCacheMaxAge": 86400000
+  }
+}

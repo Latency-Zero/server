@@ -1,0 +1,1700 @@
+/**
+ * LatZero Persistence - SQLite Storage Layer
+ * 
+ * This module provides the persistence layer for the LatZero server using SQLite
+ * for both in-memory ephemeral data and durable disk storage. It handles app
+ * registry persistence, pool metadata, trigger records, and configuration data.
+ * 
+ * Key Responsibilities:
+ * - SQLite database initialization and schema management
+ * - App registry persistence for rehydration support
+ * - Pool metadata and configuration storage
+ * - Trigger record management (ephemeral in-memory)
+ * - Memory block metadata persistence
+ * - Security configuration and key metadata storage
+ * - Database migrations and version management
+ * 
+ * Storage Strategy:
+ * - Ephemeral data: SQLite :memory: database for fast access
+ * - Durable data: SQLite file database in ~/.latzero/data.db
+ * - Automatic backup and recovery mechanisms
+ * - Transaction support for data consistency
+ */
+
+const Database = require('better-sqlite3');
+const path = require('path');
+const fs = require('fs').promises;
+const { EventEmitter } = require('events');
+const chalk = require('chalk');
+
+// Database schema version
+const SCHEMA_VERSION = 1;
+
+class PersistenceManager extends EventEmitter {
+  constructor(config = {}) {
+    super();
+    this.config = config;
+    
+    // Database connections
+    this.memoryDb = null; // In-memory database for ephemeral data
+    this.durableDb = null; // File database for persistent data
+    
+    // Database paths
+    this.dataDir = config.dataDir || path.join(require('os').homedir(), '.latzero');
+    this.durableDbPath = path.join(this.dataDir, 'data.db');
+    this.backupDir = path.join(this.dataDir, 'backups');
+    
+    // Configuration options
+    this.memoryMode = config.memoryMode || false;
+    this.walMode = config.walMode !== false; // Default to true
+    this.cacheSize = config.cacheSize || 1000;
+    this.backupInterval = config.backupInterval || 86400000; // 24 hours
+    this.maxBackups = config.maxBackups || 7;
+    
+    // Prepared statements cache
+    this.statements = new Map();
+    
+    // Transaction support
+    this.activeTransactions = new Set();
+    
+    // Connection management
+    this.isInitialized = false;
+    this.isShuttingDown = false;
+  }
+
+  /**
+   * Initialize the persistence layer
+   */
+  async initialize() {
+    console.log(chalk.blue('💾 Initializing Persistence Layer...'));
+
+    // Ensure data directory exists
+    await this._ensureDataDirectory();
+
+    // Initialize databases
+    await this._initializeMemoryDatabase();
+    await this._initializeDurableDatabase();
+
+    // Setup automatic backup
+    this._setupAutomaticBackup();
+
+    console.log(chalk.green('✅ Persistence Layer initialized'));
+    console.log(chalk.cyan(`📁 Data directory: ${this.dataDir}`));
+    console.log(chalk.cyan(`🗄️  Database: ${this.durableDbPath}`));
+  }
+
+  /**
+   * Shutdown the persistence layer
+   */
+  async shutdown() {
+    console.log(chalk.yellow('💾 Shutting down Persistence Layer...'));
+
+    // Close prepared statements
+    this.statements.clear();
+
+    // Close databases
+    if (this.memoryDb) {
+      this.memoryDb.close();
+    }
+
+    if (this.durableDb) {
+      this.durableDb.close();
+    }
+
+    console.log(chalk.green('✅ Persistence Layer shutdown complete'));
+  }
+
+  // ==========================================
+  // AppRegistry CRUD Operations
+  // ==========================================
+
+  /**
+   * Register a new application
+   */
+  async registerApp(app_id, triggers = [], pools = [], metadata = {}) {
+    if (!app_id || typeof app_id !== 'string') {
+      throw new Error('app_id is required and must be a string');
+    }
+
+    // Input validation: ensure pools, triggers, and metadata are never undefined
+    pools = pools || [];
+    triggers = triggers || [];
+    metadata = metadata || {};
+
+    const stmt = this._getStatement('registerApp', `
+      INSERT OR REPLACE INTO app_registry (
+        app_id, pools, triggers, meta, protocol_version,
+        registered, last_seen, rehydrated
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    try {
+      const now = Date.now();
+      stmt.run(
+        app_id,
+        JSON.stringify(pools),
+        JSON.stringify(triggers),
+        JSON.stringify(metadata),
+        metadata.protocolVersion || '1.0',
+        now,
+        now,
+        0
+      );
+
+      this.emit('appRegistered', app_id);
+      return { app_id, triggers, pools, metadata, registered: now };
+    } catch (error) {
+      console.error(chalk.red(`❌ Error registering app ${app_id}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get application registration by app_id
+   */
+  async getApp(app_id) {
+    if (!app_id) {
+      throw new Error('app_id is required');
+    }
+
+    const stmt = this._getStatement('getApp', `
+      SELECT * FROM app_registry WHERE app_id = ?
+    `);
+
+    try {
+      const row = stmt.get(app_id);
+      if (!row) {
+        return null;
+      }
+
+      // Safe JSON parsing with fallback defaults
+      let pools, triggers, meta;
+      try {
+        pools = JSON.parse(row.pools);
+      } catch (parseError) {
+        console.warn(chalk.yellow(`⚠️  Corrupted pools data for app ${app_id}, using fallback: []`));
+        pools = [];
+      }
+
+      try {
+        triggers = JSON.parse(row.triggers);
+      } catch (parseError) {
+        console.warn(chalk.yellow(`⚠️  Corrupted triggers data for app ${app_id}, using fallback: []`));
+        triggers = [];
+      }
+
+      try {
+        meta = JSON.parse(row.meta);
+      } catch (parseError) {
+        console.warn(chalk.yellow(`⚠️  Corrupted metadata for app ${app_id}, using fallback: {}`));
+        meta = {};
+      }
+
+      const result = {
+        appId: row.app_id,
+        pools,
+        triggers,
+        meta,
+        protocolVersion: row.protocol_version,
+        registered: row.registered,
+        lastSeen: row.last_seen,
+        rehydrated: row.rehydrated === 1
+      };
+
+      return this._validateJsonResponse(result, `getApp(${app_id})`);
+    } catch (error) {
+      console.error(chalk.red(`❌ Error getting app ${app_id}: ${error.message}`));
+      throw new Error(`Failed to retrieve app ${app_id}: ${error.message}`);
+    }
+  }
+
+  /**
+   * Update application registration
+   */
+  async updateApp(app_id, updates) {
+    if (!app_id) {
+      throw new Error('app_id is required');
+    }
+
+    const allowedFields = ['pools', 'triggers', 'meta', 'protocol_version'];
+    const updateFields = [];
+    const values = [];
+
+    for (const [key, value] of Object.entries(updates)) {
+      if (allowedFields.includes(key)) {
+        if (key === 'pools' || key === 'triggers' || key === 'meta') {
+          updateFields.push(`${key} = ?`);
+          values.push(JSON.stringify(value));
+        } else {
+          updateFields.push(`${key} = ?`);
+          values.push(value);
+        }
+      }
+    }
+
+    if (updateFields.length === 0) {
+      throw new Error('No valid fields to update');
+    }
+
+    updateFields.push('last_seen = ?');
+    values.push(Date.now());
+    values.push(app_id);
+
+    const stmt = this._getStatement(`updateApp_${updateFields.length}`, `
+      UPDATE app_registry SET ${updateFields.join(', ')} WHERE app_id = ?
+    `);
+    
+    try {
+      const result = stmt.run(...values);
+      if (result.changes === 0) {
+        throw new Error(`App ${app_id} not found`);
+      }
+      
+      this.emit('appUpdated', app_id, updates);
+      return await this.getApp(app_id);
+    } catch (error) {
+      console.error(chalk.red(`❌ Error updating app ${app_id}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Remove application registration
+   */
+  async removeApp(app_id) {
+    if (!app_id) {
+      throw new Error('app_id is required');
+    }
+
+    const stmt = this._getStatement('removeApp', `
+      DELETE FROM app_registry WHERE app_id = ?
+    `);
+    
+    try {
+      const result = stmt.run(app_id);
+      if (result.changes > 0) {
+        this.emit('appRemoved', app_id);
+      }
+      return result.changes > 0;
+    } catch (error) {
+      console.error(chalk.red(`❌ Error removing app ${app_id}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get all registered applications
+   */
+  async getAllApps() {
+    const stmt = this._getStatement('getAllApps', `
+      SELECT * FROM app_registry ORDER BY last_seen DESC
+    `);
+
+    try {
+      const rows = stmt.all([]);
+      const result = rows.map(row => ({
+        appId: row.app_id,
+        pools: JSON.parse(row.pools),
+        triggers: JSON.parse(row.triggers),
+        meta: JSON.parse(row.meta),
+        protocolVersion: row.protocol_version,
+        registered: row.registered,
+        lastSeen: row.last_seen,
+        rehydrated: row.rehydrated === 1
+      }));
+
+      return this._validateJsonResponse(result, 'getAllApps');
+    } catch (error) {
+      console.error(chalk.red('❌ Error getting all apps:'), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get applications by pool name
+   */
+  async getAppsByPool(pool_name) {
+    if (!pool_name) {
+      throw new Error('pool_name is required');
+    }
+
+    const stmt = this._getStatement('getAppsByPool', `
+      SELECT * FROM app_registry WHERE pools LIKE ? ORDER BY last_seen DESC
+    `);
+    
+    try {
+      const rows = stmt.all([`%"${pool_name}"%`]);
+      return rows
+        .map(row => {
+          let pools, triggers, meta;
+          try {
+            pools = JSON.parse(row.pools);
+          } catch {
+            pools = [];
+          }
+          try {
+            triggers = JSON.parse(row.triggers);
+          } catch {
+            triggers = [];
+          }
+          try {
+            meta = JSON.parse(row.meta);
+          } catch {
+            meta = {};
+          }
+
+          return {
+            appId: row.app_id,
+            pools,
+            triggers,
+            meta,
+            protocolVersion: row.protocol_version,
+            registered: row.registered,
+            lastSeen: row.last_seen,
+            rehydrated: row.rehydrated === 1
+          };
+        })
+        .filter(app => app.pools.includes(pool_name));
+    } catch (error) {
+      console.error(chalk.red(`❌ Error getting apps by pool ${pool_name}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Sanitize corrupted data in the database
+   */
+  async sanitizeCorruptedData() {
+    console.log(chalk.blue('🧹 Sanitizing corrupted data in database...'));
+
+    let totalSanitizedCount = 0;
+
+    try {
+      // Sanitize app_registry table
+      const appSanitizedCount = await this._sanitizeAppRegistry();
+      totalSanitizedCount += appSanitizedCount;
+
+      // Sanitize pool_metadata table
+      const poolSanitizedCount = await this._sanitizePoolMetadata();
+      totalSanitizedCount += poolSanitizedCount;
+
+      // Sanitize memory_blocks table
+      const memorySanitizedCount = await this._sanitizeMemoryBlocks();
+      totalSanitizedCount += memorySanitizedCount;
+
+      // Sanitize server_config table
+      const configSanitizedCount = await this._sanitizeServerConfig();
+      totalSanitizedCount += configSanitizedCount;
+
+      console.log(chalk.green(`✅ Sanitized ${totalSanitizedCount} total corrupted records`));
+      return totalSanitizedCount;
+    } catch (error) {
+      console.error(chalk.red('❌ Error during data sanitization:'), error.message);
+      throw error;
+    }
+  }
+  /**
+   * Reset the entire database if sanitization fails
+   */
+  async resetDatabase() {
+    console.log(chalk.yellow('🔄 Resetting database due to sanitization failure...'));
+
+    try {
+      // Close existing databases
+      if (this.memoryDb) {
+        this.memoryDb.close();
+      }
+      if (this.durableDb) {
+        this.durableDb.close();
+      }
+
+      // Clear prepared statements
+      this.statements.clear();
+
+      // Remove the database file
+      try {
+        await fs.unlink(this.durableDbPath);
+        console.log(chalk.yellow(`🗑️  Removed corrupted database file: ${this.durableDbPath}`));
+      } catch (error) {
+        // File might not exist, which is fine
+        console.log(chalk.yellow('ℹ️  Database file did not exist or could not be removed'));
+      }
+
+      // Reinitialize databases
+      await this._initializeMemoryDatabase();
+      await this._initializeDurableDatabase();
+
+      console.log(chalk.green('✅ Database reset completed successfully'));
+    } catch (error) {
+      console.error(chalk.red('❌ Database reset failed:'), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Sanitize app_registry table
+   */
+  async _sanitizeAppRegistry() {
+    let sanitizedCount = 0;
+
+    try {
+      const stmt = this._getStatement('getAllAppsForSanitization', `
+        SELECT app_id, pools, triggers, meta FROM app_registry
+      `);
+
+      const rows = stmt.all([]);
+
+      for (const row of rows) {
+        const updates = {};
+        let needsUpdate = false;
+
+        // Check and sanitize pools
+        if (!this._isValidJsonString(row.pools)) {
+          console.warn(chalk.yellow(`⚠️  Sanitizing corrupted pools for app ${row.app_id}`));
+          updates.pools = [];
+          needsUpdate = true;
+        }
+
+        // Check and sanitize triggers
+        if (!this._isValidJsonString(row.triggers)) {
+          console.warn(chalk.yellow(`⚠️  Sanitizing corrupted triggers for app ${row.app_id}`));
+          updates.triggers = [];
+          needsUpdate = true;
+        }
+
+        // Check and sanitize meta
+        if (!this._isValidJsonString(row.meta)) {
+          console.warn(chalk.yellow(`⚠️  Sanitizing corrupted metadata for app ${row.app_id}`));
+          updates.meta = {};
+          needsUpdate = true;
+        }
+
+        if (needsUpdate) {
+          await this.updateApp(row.app_id, updates);
+          sanitizedCount++;
+        }
+      }
+    } catch (error) {
+      console.error(chalk.red('❌ Error sanitizing app registry:'), error.message);
+      throw error;
+    }
+
+    return sanitizedCount;
+  }
+
+  /**
+   * Sanitize pool_metadata table
+   */
+  async _sanitizePoolMetadata() {
+    let sanitizedCount = 0;
+
+    try {
+      const stmt = this._getStatement('getAllPoolsForSanitization', `
+        SELECT name, owners, policies, config FROM pool_metadata
+      `);
+
+      const rows = stmt.all([]);
+
+      for (const row of rows) {
+        const updates = {};
+        let needsUpdate = false;
+
+        // Check and sanitize owners
+        if (!this._isValidJsonString(row.owners)) {
+          console.warn(chalk.yellow(`⚠️  Sanitizing corrupted owners for pool ${row.name}`));
+          updates.owners = [];
+          needsUpdate = true;
+        }
+
+        // Check and sanitize policies
+        if (!this._isValidJsonString(row.policies)) {
+          console.warn(chalk.yellow(`⚠️  Sanitizing corrupted policies for pool ${row.name}`));
+          updates.policies = {};
+          needsUpdate = true;
+        }
+
+        // Check and sanitize config
+        if (!this._isValidJsonString(row.config)) {
+          console.warn(chalk.yellow(`⚠️  Sanitizing corrupted config for pool ${row.name}`));
+          const pool = await this.getPool(row.name);
+          updates.config = pool ? { ...pool, config: undefined } : {};
+          needsUpdate = true;
+        }
+
+        if (needsUpdate) {
+          await this.updatePool(row.name, updates);
+          sanitizedCount++;
+        }
+      }
+    } catch (error) {
+      console.error(chalk.red('❌ Error sanitizing pool metadata:'), error.message);
+      throw error;
+    }
+
+    return sanitizedCount;
+  }
+
+  /**
+   * Sanitize memory_blocks table
+   */
+  async _sanitizeMemoryBlocks() {
+    let sanitizedCount = 0;
+
+    try {
+      const stmt = this._getStatement('getAllMemoryBlocksForSanitization', `
+        SELECT block_id, permissions, config FROM memory_blocks
+      `);
+
+      const rows = stmt.all([]);
+
+      for (const row of rows) {
+        const updates = {};
+        let needsUpdate = false;
+
+        // Check and sanitize permissions
+        if (!this._isValidJsonString(row.permissions)) {
+          console.warn(chalk.yellow(`⚠️  Sanitizing corrupted permissions for memory block ${row.block_id}`));
+          updates.permissions = { read: ['*'], write: ['*'] };
+          needsUpdate = true;
+        }
+
+        // Check and sanitize config
+        if (!this._isValidJsonString(row.config)) {
+          console.warn(chalk.yellow(`⚠️  Sanitizing corrupted config for memory block ${row.block_id}`));
+          const block = await this.getMemoryBlock(row.block_id);
+          updates.config = block ? { ...block, config: undefined } : {};
+          needsUpdate = true;
+        }
+
+        if (needsUpdate) {
+          await this.updateMemoryBlock(row.block_id, updates);
+          sanitizedCount++;
+        }
+      }
+    } catch (error) {
+      console.error(chalk.red('❌ Error sanitizing memory blocks:'), error.message);
+      throw error;
+    }
+
+    return sanitizedCount;
+  }
+
+  /**
+   * Sanitize server_config table
+   */
+  async _sanitizeServerConfig() {
+    let sanitizedCount = 0;
+
+    try {
+      const stmt = this._getStatement('getAllServerConfigForSanitization', `
+        SELECT key, value FROM server_config
+      `);
+
+      const rows = stmt.all([]);
+
+      for (const row of rows) {
+        // Check if value is valid JSON
+        if (!this._isValidJsonString(row.value)) {
+          console.warn(chalk.yellow(`⚠️  Sanitizing corrupted config value for key ${row.key}`));
+          // Remove corrupted config entry
+          const deleteStmt = this._getStatement('deleteServerConfig', `
+            DELETE FROM server_config WHERE key = ?
+          `);
+          deleteStmt.run(row.key);
+          sanitizedCount++;
+        }
+      }
+    } catch (error) {
+      console.error(chalk.red('❌ Error sanitizing server config:'), error.message);
+      throw error;
+    }
+
+    return sanitizedCount;
+  }
+
+  /**
+   * Check if a string is valid JSON
+   */
+  _isValidJsonString(str) {
+    if (typeof str !== 'string' || str.trim() === '' || str === 'undefined' || str === 'null') {
+      return false;
+    }
+    try {
+      JSON.parse(str);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
+   * Save app registration for rehydration (legacy method)
+   */
+  async saveAppRegistration(registration) {
+    return await this.registerApp(
+      registration.appId,
+      registration.triggers,
+      registration.pools,
+      {
+        ...registration.meta,
+        protocolVersion: registration.protocolVersion,
+        rehydrated: registration.rehydrated
+      }
+    );
+  }
+  /**
+   * Validate JSON response data to prevent malformed data from reaching clients
+   */
+  _validateJsonResponse(data, context = 'unknown') {
+    try {
+      // Ensure the data can be safely serialized to JSON
+      JSON.stringify(data);
+      return data;
+    } catch (error) {
+      console.error(chalk.red(`❌ Malformed JSON response detected in ${context}:`), error.message);
+      console.error(chalk.yellow('⚠️  Returning safe fallback data'));
+
+      // Return safe fallback based on context
+      if (context.includes('app')) {
+        return null; // For single app queries
+      } else if (context.includes('apps')) {
+        return []; // For app lists
+      } else if (context.includes('pool')) {
+        return null; // For single pool queries
+      } else if (context.includes('pools')) {
+        return []; // For pool lists
+      } else if (context.includes('memoryBlock')) {
+        return null; // For single memory block queries
+      } else if (context.includes('memoryBlocks')) {
+        return []; // For memory block lists
+      } else {
+        return null; // Default safe fallback
+      }
+    }
+  }
+
+  /**
+   * Load app registrations for rehydration
+   */
+  async loadAppRegistrations() {
+    const stmt = this._getStatement('loadAppRegistrations', `
+      SELECT * FROM app_registry ORDER BY last_seen DESC
+    `);
+
+    try {
+      const rows = stmt.all([]);
+
+      return rows.map(row => {
+        let pools, triggers, meta;
+        try {
+          pools = JSON.parse(row.pools);
+        } catch {
+          pools = [];
+        }
+        try {
+          triggers = JSON.parse(row.triggers);
+        } catch {
+          triggers = [];
+        }
+        try {
+          meta = JSON.parse(row.meta);
+        } catch {
+          meta = {};
+        }
+
+        return {
+          appId: row.app_id,
+          pools,
+          triggers,
+          meta,
+          protocolVersion: row.protocol_version,
+          registered: row.registered,
+          lastSeen: row.last_seen,
+          rehydrated: row.rehydrated === 1
+        };
+      });
+    } catch (error) {
+      console.error(chalk.red('❌ Error loading app registrations:'), error.message);
+      throw error;
+    }
+  }
+
+  // ==========================================
+  // Pool CRUD Operations
+  // ==========================================
+
+  /**
+   * Create a new pool
+   */
+  async createPool(name, type = 'local', encrypted = false, properties = {}) {
+    if (!name || typeof name !== 'string') {
+      throw new Error('Pool name is required and must be a string');
+    }
+
+    console.log(chalk.blue(`🏊 Creating pool: ${name}, type: ${type}, encrypted: ${encrypted}`));
+
+    const validTypes = ['local', 'global', 'encrypted'];
+    if (!validTypes.includes(type)) {
+      throw new Error(`Invalid pool type: ${type}. Must be one of: ${validTypes.join(', ')}`);
+    }
+
+    const stmt = this._getStatement('createPool', `
+      INSERT INTO pool_metadata (
+        name, type, encrypted, owners, policies, description,
+        created, updated, config
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    
+    try {
+      const now = Date.now();
+      const poolConfig = {
+        name,
+        type,
+        encrypted,
+        owners: properties.owners || [],
+        policies: properties.policies || {},
+        description: properties.description || '',
+        created: now,
+        updated: now,
+        ...properties
+      };
+
+      const params = [
+        name,
+        type,
+        encrypted ? 1 : 0,
+        JSON.stringify(poolConfig.owners),
+        JSON.stringify(poolConfig.policies),
+        poolConfig.description,
+        now,
+        now,
+        JSON.stringify(poolConfig)
+      ];
+
+      console.log(chalk.cyan(`🏊 SQL params for pool ${name}:`), params);
+      console.log('DEBUG: stmt type:', typeof stmt);
+      console.log('DEBUG: stmt.run type:', typeof stmt.run);
+      console.log('DEBUG: params array:', params);
+      console.log('DEBUG: params length:', params.length);
+      stmt.run(params);
+      
+      this.emit('poolCreated', name, poolConfig);
+      return poolConfig;
+    } catch (error) {
+      if (error.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') {
+        throw new Error(`Pool '${name}' already exists`);
+      }
+      console.error(chalk.red(`❌ Error creating pool ${name}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get pool metadata by name
+   */
+  async getPool(name) {
+    if (!name) {
+      throw new Error('Pool name is required');
+    }
+
+    const stmt = this._getStatement('getPool', `
+      SELECT * FROM pool_metadata WHERE name = ?
+    `);
+    
+    try {
+      const row = stmt.get(name);
+      if (!row) {
+        return null;
+      }
+      
+      return {
+        name: row.name,
+        type: row.type,
+        encrypted: row.encrypted === 1,
+        owners: JSON.parse(row.owners),
+        policies: JSON.parse(row.policies),
+        description: row.description,
+        created: row.created,
+        updated: row.updated,
+        ...JSON.parse(row.config)
+      };
+    } catch (error) {
+      console.error(chalk.red(`❌ Error getting pool ${name}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Update pool properties
+   */
+  async updatePool(name, updates) {
+    if (!name) {
+      throw new Error('Pool name is required');
+    }
+
+    const allowedFields = ['type', 'encrypted', 'owners', 'policies', 'description'];
+    const updateFields = [];
+    const values = [];
+
+    for (const [key, value] of Object.entries(updates)) {
+      if (allowedFields.includes(key)) {
+        if (key === 'owners' || key === 'policies') {
+          updateFields.push(`${key} = ?`);
+          values.push(JSON.stringify(value));
+        } else if (key === 'encrypted') {
+          updateFields.push(`${key} = ?`);
+          values.push(value ? 1 : 0);
+        } else {
+          updateFields.push(`${key} = ?`);
+          values.push(value);
+        }
+      }
+    }
+
+    if (updateFields.length === 0) {
+      throw new Error('No valid fields to update');
+    }
+
+    // Update the config JSON as well
+    const currentPool = await this.getPool(name);
+    if (!currentPool) {
+      throw new Error(`Pool '${name}' not found`);
+    }
+
+    const updatedConfig = { ...currentPool, ...updates, updated: Date.now() };
+    updateFields.push('updated = ?', 'config = ?');
+    values.push(Date.now(), JSON.stringify(updatedConfig));
+    values.push(name);
+
+    const stmt = this._getStatement(`updatePool_${updateFields.length}`, `
+      UPDATE pool_metadata SET ${updateFields.join(', ')} WHERE name = ?
+    `);
+    
+    try {
+      const result = stmt.run(values);
+      if (result.changes === 0) {
+        throw new Error(`Pool '${name}' not found`);
+      }
+      
+      this.emit('poolUpdated', name, updates);
+      return await this.getPool(name);
+    } catch (error) {
+      console.error(chalk.red(`❌ Error updating pool ${name}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Remove a pool
+   */
+  async removePool(name) {
+    if (!name) {
+      throw new Error('Pool name is required');
+    }
+
+    const stmt = this._getStatement('removePool', `
+      DELETE FROM pool_metadata WHERE name = ?
+    `);
+    
+    try {
+      const result = stmt.run(name);
+      if (result.changes > 0) {
+        this.emit('poolRemoved', name);
+      }
+      return result.changes > 0;
+    } catch (error) {
+      console.error(chalk.red(`❌ Error removing pool ${name}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get all pools
+   */
+  async getAllPools() {
+    const stmt = this._getStatement('getAllPools', `
+      SELECT * FROM pool_metadata ORDER BY created ASC
+    `);
+
+    try {
+      const rows = stmt.all([]);
+      return rows.map(row => ({
+        name: row.name,
+        type: row.type,
+        encrypted: row.encrypted === 1,
+        owners: JSON.parse(row.owners),
+        policies: JSON.parse(row.policies),
+        description: row.description,
+        created: row.created,
+        updated: row.updated,
+        ...JSON.parse(row.config)
+      }));
+    } catch (error) {
+      console.error(chalk.red('❌ Error getting all pools:'), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get pools by type
+   */
+  async getPoolsByType(type) {
+    if (!type) {
+      throw new Error('Pool type is required');
+    }
+
+    const stmt = this._getStatement('getPoolsByType', `
+      SELECT * FROM pool_metadata WHERE type = ? ORDER BY created ASC
+    `);
+    
+    try {
+      const rows = stmt.all([type]);
+      return rows.map(row => ({
+        name: row.name,
+        type: row.type,
+        encrypted: row.encrypted === 1,
+        owners: JSON.parse(row.owners),
+        policies: JSON.parse(row.policies),
+        description: row.description,
+        created: row.created,
+        updated: row.updated,
+        ...JSON.parse(row.config)
+      }));
+    } catch (error) {
+      console.error(chalk.red(`❌ Error getting pools by type ${type}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Save pool metadata (legacy method)
+   */
+  async savePoolMetadata(poolName, metadata) {
+    return await this.createPool(
+      poolName,
+      metadata.type,
+      metadata.encrypted,
+      metadata
+    );
+  }
+
+  /**
+   * Load pool metadata
+   */
+  async loadPoolMetadata() {
+    const stmt = this._getStatement('loadPoolMetadata', `
+      SELECT * FROM pool_metadata ORDER BY created ASC
+    `);
+    
+    try {
+      const rows = stmt.all([]);
+      const metadata = new Map();
+      
+      for (const row of rows) {
+        metadata.set(row.name, {
+          name: row.name,
+          type: row.type,
+          encrypted: row.encrypted === 1,
+          owners: JSON.parse(row.owners),
+          policies: JSON.parse(row.policies),
+          description: row.description,
+          created: row.created,
+          updated: row.updated,
+          ...JSON.parse(row.config)
+        });
+      }
+      
+      return metadata;
+    } catch (error) {
+      console.error(chalk.red('❌ Error loading pool metadata:'), error.message);
+      throw error;
+    }
+  }
+
+  // ==========================================
+  // Memory Block CRUD Operations
+  // ==========================================
+
+  /**
+   * Create memory block metadata
+   */
+  async createMemoryBlock(block_id, size, type = 'binary', permissions = {}) {
+    if (!block_id || typeof block_id !== 'string') {
+      throw new Error('block_id is required and must be a string');
+    }
+
+    if (!size || typeof size !== 'number' || size <= 0) {
+      throw new Error('size is required and must be a positive number');
+    }
+
+    const validTypes = ['binary', 'json', 'stream'];
+    if (!validTypes.includes(type)) {
+      throw new Error(`Invalid block type: ${type}. Must be one of: ${validTypes.join(', ')}`);
+    }
+
+    const stmt = this._getStatement('createMemoryBlock', `
+      INSERT INTO memory_blocks (
+        block_id, name, pool, size, type, permissions, version,
+        created, updated, persistent, encrypted, config
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    
+    try {
+      const now = Date.now();
+      const blockConfig = {
+        id: block_id,
+        name: permissions.name || block_id,
+        pool: permissions.pool || 'default',
+        size,
+        type,
+        permissions: permissions.permissions || { read: ['*'], write: ['*'] },
+        version: 1,
+        created: now,
+        updated: now,
+        persistent: permissions.persistent || false,
+        encrypted: permissions.encrypted || false,
+        ...permissions
+      };
+
+      stmt.run(
+        block_id,
+        blockConfig.name,
+        blockConfig.pool,
+        size,
+        type,
+        JSON.stringify(blockConfig.permissions),
+        1,
+        now,
+        now,
+        blockConfig.persistent ? 1 : 0,
+        blockConfig.encrypted ? 1 : 0,
+        JSON.stringify(blockConfig)
+      );
+      
+      this.emit('memoryBlockCreated', block_id, blockConfig);
+      return blockConfig;
+    } catch (error) {
+      if (error.code === 'SQLITE_CONSTRAINT_PRIMARYKEY') {
+        throw new Error(`Memory block '${block_id}' already exists`);
+      }
+      console.error(chalk.red(`❌ Error creating memory block ${block_id}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get memory block metadata by block_id
+   */
+  async getMemoryBlock(block_id) {
+    if (!block_id) {
+      throw new Error('block_id is required');
+    }
+
+    const stmt = this._getStatement('getMemoryBlock', `
+      SELECT * FROM memory_blocks WHERE block_id = ?
+    `);
+    
+    try {
+      const row = stmt.get(block_id);
+      if (!row) {
+        return null;
+      }
+      
+      return {
+        id: row.block_id,
+        name: row.name,
+        pool: row.pool,
+        size: row.size,
+        type: row.type,
+        permissions: JSON.parse(row.permissions),
+        version: row.version,
+        created: row.created,
+        updated: row.updated,
+        persistent: row.persistent === 1,
+        encrypted: row.encrypted === 1,
+        ...JSON.parse(row.config)
+      };
+    } catch (error) {
+      console.error(chalk.red(`❌ Error getting memory block ${block_id}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Update memory block metadata
+   */
+  async updateMemoryBlock(block_id, updates) {
+    if (!block_id) {
+      throw new Error('block_id is required');
+    }
+
+    const allowedFields = ['name', 'pool', 'type', 'permissions', 'persistent', 'encrypted'];
+    const updateFields = [];
+    const values = [];
+
+    for (const [key, value] of Object.entries(updates)) {
+      if (allowedFields.includes(key)) {
+        if (key === 'permissions') {
+          updateFields.push(`${key} = ?`);
+          values.push(JSON.stringify(value));
+        } else if (key === 'persistent' || key === 'encrypted') {
+          updateFields.push(`${key} = ?`);
+          values.push(value ? 1 : 0);
+        } else {
+          updateFields.push(`${key} = ?`);
+          values.push(value);
+        }
+      }
+    }
+
+    if (updateFields.length === 0) {
+      throw new Error('No valid fields to update');
+    }
+
+    // Update version and timestamp
+    updateFields.push('version = version + 1', 'updated = ?');
+    values.push(Date.now());
+
+    // Update the config JSON as well
+    const currentBlock = await this.getMemoryBlock(block_id);
+    if (!currentBlock) {
+      throw new Error(`Memory block '${block_id}' not found`);
+    }
+
+    const updatedConfig = { ...currentBlock, ...updates, updated: Date.now(), version: currentBlock.version + 1 };
+    updateFields.push('config = ?');
+    values.push(JSON.stringify(updatedConfig));
+    values.push(block_id);
+
+    const stmt = this._getStatement(`updateMemoryBlock_${updateFields.length}`, `
+      UPDATE memory_blocks SET ${updateFields.join(', ')} WHERE block_id = ?
+    `);
+    
+    try {
+      const result = stmt.run(...values);
+      if (result.changes === 0) {
+        throw new Error(`Memory block '${block_id}' not found`);
+      }
+      
+      this.emit('memoryBlockUpdated', block_id, updates);
+      return await this.getMemoryBlock(block_id);
+    } catch (error) {
+      console.error(chalk.red(`❌ Error updating memory block ${block_id}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Remove memory block metadata
+   */
+  async removeMemoryBlock(block_id) {
+    if (!block_id) {
+      throw new Error('block_id is required');
+    }
+
+    const stmt = this._getStatement('removeMemoryBlock', `
+      DELETE FROM memory_blocks WHERE block_id = ?
+    `);
+    
+    try {
+      const result = stmt.run(block_id);
+      if (result.changes > 0) {
+        this.emit('memoryBlockRemoved', block_id);
+      }
+      return result.changes > 0;
+    } catch (error) {
+      console.error(chalk.red(`❌ Error removing memory block ${block_id}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get all memory blocks
+   */
+  async getAllMemoryBlocks() {
+    const stmt = this._getStatement('getAllMemoryBlocks', `
+      SELECT * FROM memory_blocks ORDER BY created ASC
+    `);
+    
+    try {
+      const rows = stmt.all([]);
+      return rows.map(row => ({
+        id: row.block_id,
+        name: row.name,
+        pool: row.pool,
+        size: row.size,
+        type: row.type,
+        permissions: JSON.parse(row.permissions),
+        version: row.version,
+        created: row.created,
+        updated: row.updated,
+        persistent: row.persistent === 1,
+        encrypted: row.encrypted === 1,
+        ...JSON.parse(row.config)
+      }));
+    } catch (error) {
+      console.error(chalk.red('❌ Error getting all memory blocks:'), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get memory blocks by pool
+   */
+  async getMemoryBlocksByPool(pool_name) {
+    if (!pool_name) {
+      throw new Error('pool_name is required');
+    }
+
+    const stmt = this._getStatement('getMemoryBlocksByPool', `
+      SELECT * FROM memory_blocks WHERE pool = ? ORDER BY created ASC
+    `);
+    
+    try {
+      const rows = stmt.all([pool_name]);
+      return rows.map(row => ({
+        id: row.block_id,
+        name: row.name,
+        pool: row.pool,
+        size: row.size,
+        type: row.type,
+        permissions: JSON.parse(row.permissions),
+        version: row.version,
+        created: row.created,
+        updated: row.updated,
+        persistent: row.persistent === 1,
+        encrypted: row.encrypted === 1,
+        ...JSON.parse(row.config)
+      }));
+    } catch (error) {
+      console.error(chalk.red(`❌ Error getting memory blocks by pool ${pool_name}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Save memory block metadata (legacy method)
+   */
+  async saveMemoryBlockMetadata(blockId, metadata) {
+    return await this.createMemoryBlock(
+      blockId,
+      metadata.size,
+      metadata.type,
+      metadata
+    );
+  }
+
+  /**
+   * Load memory block metadata
+   */
+  async loadMemoryBlockMetadata() {
+    const stmt = this._getStatement('loadMemoryBlockMetadata', `
+      SELECT * FROM memory_blocks ORDER BY created ASC
+    `);
+    
+    try {
+      const rows = stmt.all([]);
+      const metadata = new Map();
+      
+      for (const row of rows) {
+        metadata.set(row.block_id, {
+          id: row.block_id,
+          name: row.name,
+          pool: row.pool,
+          size: row.size,
+          type: row.type,
+          permissions: JSON.parse(row.permissions),
+          version: row.version,
+          created: row.created,
+          updated: row.updated,
+          persistent: row.persistent === 1,
+          encrypted: row.encrypted === 1,
+          ...JSON.parse(row.config)
+        });
+      }
+      
+      return metadata;
+    } catch (error) {
+      console.error(chalk.red('❌ Error loading memory block metadata:'), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Create trigger record (ephemeral, in-memory)
+   */
+  async createTriggerRecord(record) {
+    const stmt = this._getStatement('createTriggerRecord', `
+      INSERT INTO trigger_records (
+        id, origin_app_id, origin_connection_id, destination, pool,
+        process, created, ttl, dispatched_to, completed
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, true); // Use memory database
+    
+    try {
+      stmt.run(
+        record.id,
+        record.originAppId,
+        record.originConnectionId,
+        record.destination,
+        record.pool,
+        record.process,
+        record.created,
+        record.ttl,
+        record.dispatchedTo,
+        record.completed ? 1 : 0
+      );
+    } catch (error) {
+      console.error(chalk.red(`❌ Error creating trigger record ${record.id}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Update trigger record
+   */
+  async updateTriggerRecord(recordId, updates) {
+    const stmt = this._getStatement('updateTriggerRecord', `
+      UPDATE trigger_records 
+      SET dispatched_to = ?, completed = ?, updated = ?
+      WHERE id = ?
+    `, true); // Use memory database
+    
+    try {
+      stmt.run(
+        updates.dispatchedTo,
+        updates.completed ? 1 : 0,
+        Date.now(),
+        recordId
+      );
+    } catch (error) {
+      console.error(chalk.red(`❌ Error updating trigger record ${recordId}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Delete trigger record
+   */
+  async deleteTriggerRecord(recordId) {
+    const stmt = this._getStatement('deleteTriggerRecord', `
+      DELETE FROM trigger_records WHERE id = ?
+    `, true); // Use memory database
+    
+    try {
+      stmt.run(recordId);
+    } catch (error) {
+      console.error(chalk.red(`❌ Error deleting trigger record ${recordId}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Cleanup expired trigger records
+   */
+  async cleanupExpiredTriggerRecords() {
+    const stmt = this._getStatement('cleanupExpiredTriggerRecords', `
+      DELETE FROM trigger_records 
+      WHERE (created + ttl) < ? AND completed = 0
+    `, true); // Use memory database
+    
+    try {
+      const result = stmt.run(Date.now());
+      
+      if (result.changes > 0) {
+        console.log(chalk.yellow(`🧹 Cleaned up ${result.changes} expired trigger records`));
+      }
+      
+      return result.changes;
+    } catch (error) {
+      console.error(chalk.red('❌ Error cleaning up expired trigger records:'), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Save server configuration
+   */
+  async saveServerConfig(key, value) {
+    const stmt = this._getStatement('saveServerConfig', `
+      INSERT OR REPLACE INTO server_config (key, value, updated)
+      VALUES (?, ?, ?)
+    `);
+    
+    try {
+      stmt.run(key, JSON.stringify(value), Date.now());
+    } catch (error) {
+      console.error(chalk.red(`❌ Error saving server config ${key}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Load server configuration
+   */
+  async loadServerConfig(key = null) {
+    const stmt = key 
+      ? this._getStatement('loadServerConfigKey', `SELECT * FROM server_config WHERE key = ?`)
+      : this._getStatement('loadServerConfigAll', `SELECT * FROM server_config`);
+    
+    try {
+      const rows = key ? (stmt.get(key) ? [stmt.get(key)] : []) : stmt.all([]);
+      
+      if (key) {
+        return rows.length > 0 ? JSON.parse(rows[0].value) : null;
+      }
+      
+      const config = {};
+      for (const row of rows) {
+        config[row.key] = JSON.parse(row.value);
+      }
+      
+      return config;
+    } catch (error) {
+      console.error(chalk.red(`❌ Error loading server config ${key || 'all'}:`), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Execute within a transaction
+   */
+  async transaction(callback, useDurable = true) {
+    const db = useDurable ? this.durableDb : this.memoryDb;
+    const transactionId = `tx_${Date.now()}_${Math.random()}`;
+    
+    this.activeTransactions.add(transactionId);
+    
+    const transaction = db.transaction(callback);
+    
+    try {
+      const result = transaction();
+      this.activeTransactions.delete(transactionId);
+      return result;
+    } catch (error) {
+      this.activeTransactions.delete(transactionId);
+      throw error;
+    }
+  }
+
+  /**
+   * Create database backup
+   */
+  async createBackup() {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupPath = path.join(this.backupDir, `backup_${timestamp}.db`);
+    
+    try {
+      await fs.mkdir(this.backupDir, { recursive: true });
+      await this.durableDb.backup(backupPath);
+      
+      console.log(chalk.green(`📦 Database backup created: ${backupPath}`));
+      
+      this.emit('backupCreated', backupPath);
+      return backupPath;
+    } catch (error) {
+      console.error(chalk.red('❌ Error creating database backup:'), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get prepared statement (cached)
+   */
+  _getStatement(name, sql, useMemory = false) {
+    const key = `${name}_${useMemory ? 'memory' : 'durable'}`;
+
+    if (!this.statements.has(key)) {
+      const db = useMemory ? this.memoryDb : this.durableDb;
+      console.log(`DEBUG: Preparing statement '${name}' on ${useMemory ? 'memory' : 'durable'} db`);
+      console.log('DEBUG: db type:', typeof db, db ? 'defined' : 'undefined');
+      if (db && typeof db.prepare === 'function') {
+        const stmt = db.prepare(sql);
+        console.log('DEBUG: db.prepare() returned:', typeof stmt, stmt ? 'defined' : 'undefined');
+        if (stmt && typeof stmt.all === 'function') {
+          console.log('DEBUG: stmt.all is a function');
+        } else {
+          console.log('DEBUG: stmt.all is NOT a function or stmt is undefined');
+        }
+        this.statements.set(key, stmt);
+      } else {
+        console.error('DEBUG: db.prepare is not a function or db is undefined');
+        this.statements.set(key, null);
+      }
+    }
+
+    const cachedStmt = this.statements.get(key);
+    console.log(`DEBUG: Returning cached statement '${name}':`, typeof cachedStmt, cachedStmt ? 'defined' : 'undefined');
+    return cachedStmt;
+  }
+
+  /**
+   * Ensure data directory exists
+   */
+  async _ensureDataDirectory() {
+    try {
+      await fs.mkdir(this.dataDir, { recursive: true });
+      await fs.mkdir(this.backupDir, { recursive: true });
+    } catch (error) {
+      console.error(chalk.red('❌ Failed to create data directory:'), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Initialize in-memory database for ephemeral data
+   */
+  async _initializeMemoryDatabase() {
+    console.log(chalk.blue('🧠 Initializing in-memory database...'));
+
+    this.memoryDb = new Database(':memory:');
+
+    // Create ephemeral tables
+    this.memoryDb.exec(`
+      CREATE TABLE trigger_records (
+        id TEXT PRIMARY KEY,
+        origin_app_id TEXT NOT NULL,
+        origin_connection_id INTEGER,
+        destination TEXT,
+        pool TEXT NOT NULL,
+        process TEXT NOT NULL,
+        created INTEGER NOT NULL,
+        ttl INTEGER NOT NULL,
+        dispatched_to TEXT,
+        completed INTEGER DEFAULT 0,
+        updated INTEGER DEFAULT 0
+      );
+
+      CREATE INDEX idx_trigger_records_created ON trigger_records(created);
+      CREATE INDEX idx_trigger_records_pool ON trigger_records(pool);
+      CREATE INDEX idx_trigger_records_process ON trigger_records(process);
+    `);
+  }
+
+  /**
+   * Initialize durable database for persistent data
+   */
+  async _initializeDurableDatabase() {
+    console.log(chalk.blue('💽 Initializing durable database...'));
+
+    this.durableDb = new Database(this.durableDbPath);
+
+    // Create or migrate schema
+    await this._createOrMigrateSchema();
+  }
+
+  /**
+   * Create or migrate database schema
+   */
+  async _createOrMigrateSchema() {
+    // Check current schema version
+    let currentVersion = 0;
+    try {
+      const stmt = this.durableDb.prepare('SELECT value FROM server_config WHERE key = ?');
+      const result = stmt.get('schema_version');
+      currentVersion = result ? parseInt(JSON.parse(result.value)) : 0;
+    } catch (error) {
+      // Schema doesn't exist yet
+    }
+
+    if (currentVersion < SCHEMA_VERSION) {
+      console.log(chalk.blue(`📊 Migrating database schema from v${currentVersion} to v${SCHEMA_VERSION}...`));
+
+      // Create tables
+      this.durableDb.exec(`
+        CREATE TABLE IF NOT EXISTS app_registry (
+          app_id TEXT PRIMARY KEY,
+          pools TEXT NOT NULL,
+          triggers TEXT NOT NULL,
+          meta TEXT NOT NULL,
+          protocol_version TEXT,
+          registered INTEGER NOT NULL,
+          last_seen INTEGER NOT NULL,
+          rehydrated INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS pool_metadata (
+          name TEXT PRIMARY KEY,
+          type TEXT NOT NULL,
+          encrypted INTEGER DEFAULT 0,
+          owners TEXT NOT NULL,
+          policies TEXT NOT NULL,
+          description TEXT,
+          created INTEGER NOT NULL,
+          updated INTEGER NOT NULL,
+          config TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_blocks (
+          block_id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          pool TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          type TEXT NOT NULL,
+          permissions TEXT NOT NULL,
+          version INTEGER DEFAULT 1,
+          created INTEGER NOT NULL,
+          updated INTEGER NOT NULL,
+          persistent INTEGER DEFAULT 0,
+          encrypted INTEGER DEFAULT 0,
+          config TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS server_config (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_app_registry_last_seen ON app_registry(last_seen);
+        CREATE INDEX IF NOT EXISTS idx_pool_metadata_type ON pool_metadata(type);
+        CREATE INDEX IF NOT EXISTS idx_memory_blocks_pool ON memory_blocks(pool);
+        CREATE INDEX IF NOT EXISTS idx_memory_blocks_type ON memory_blocks(type);
+      `);
+
+      // Update schema version
+      const stmt = this.durableDb.prepare('INSERT OR REPLACE INTO server_config (key, value, updated) VALUES (?, ?, ?)');
+      stmt.run(['schema_version', JSON.stringify(SCHEMA_VERSION), Date.now()]);
+
+      console.log(chalk.green(`✅ Database schema migrated to v${SCHEMA_VERSION}`));
+    }
+  }
+
+  /**
+   * Setup automatic backup
+   */
+  _setupAutomaticBackup() {
+    const backupInterval = this.config.backupInterval || 86400000; // 24 hours
+    
+    setInterval(() => {
+      this.createBackup().catch(error => {
+        console.error(chalk.red('❌ Automatic backup failed:'), error.message);
+      });
+    }, backupInterval);
+  }
+
+  /**
+   * Get persistence statistics
+   */
+  getStats() {
+    const durableStats = this.durableDb ? {
+      size: 0, // better-sqlite3 doesn't provide easy file size access
+      tables: this.durableDb.prepare("SELECT COUNT(*) as count FROM sqlite_master WHERE type='table'").get().count
+    } : null;
+
+    const memoryStats = this.memoryDb ? {
+      triggerRecords: this.memoryDb.prepare('SELECT COUNT(*) as count FROM trigger_records').get().count
+    } : null;
+
+    return {
+      schemaVersion: SCHEMA_VERSION,
+      dataDirectory: this.dataDir,
+      durableDatabase: durableStats,
+      memoryDatabase: memoryStats,
+      activeTransactions: this.activeTransactions.size,
+      preparedStatements: this.statements.size
+    };
+  }
+}
+
+module.exports = { PersistenceManager, Persistence: PersistenceManager, SCHEMA_VERSION };
